@@ -29,8 +29,7 @@ Do not use against systems you don't own or have explicit written permission to 
 
 ```bash
 git clone https://github.com/xxMTMxx/Katarina.git
-cd Katarina-
-chmod +x katarina.py
+
 ```
 
 ---
