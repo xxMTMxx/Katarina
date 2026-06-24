@@ -28,7 +28,7 @@ Do not use against systems you don't own or have explicit written permission to 
 ## 📥 Installation
 
 ```bash
-git clone https://github.com/xxMTMxx/Katarina-.git
+git clone https://github.com/xxMTMxx/Katarina.git
 cd Katarina-
 chmod +x katarina.py
 ```
