@@ -37,13 +37,13 @@ chmod +x katarina.py
 
 ## 🔍 What it does
 
-- Host Discovery & OS Detection
-- Port Scanning (TCP/UDP)
+- Host Discovery 
+- Port Scanning
 - Firewall Analysis
 - Service & Version Detection
 - Service Enumeration
-- Vulnerability Search (ExploitDB + NVD)
-- Recommendations & Next Steps
+- Vulnerability Search
+- Recommendations 
 - Scan Metadata & Report Generation
 
 ---
@@ -52,6 +52,7 @@ chmod +x katarina.py
 
 ```
 ./katarina.py <target> [options]
+try ./katarina.py --help
 
 TARGET:
   192.168.1.1            Single IP
