@@ -51,8 +51,15 @@ git clone https://github.com/xxMTMxx/Katarina.git
 
 ```
 
-./katarina.py <target> [options]
-./katarina.py --help
+katarina.py [-h help menu] [-p PORTS] [-s {tcp,udp,both}] [-t {stealth,normal,aggressive}] [-o OUTPUT]
+
+EXAMPLES:
+  ./katarina.py 192.168.1.1
+  ./katarina.py 192.168.1.1 -p top100 -s tcp -o report.pdf
+  ./katarina.py 192.168.1.1-20 -p top1000 -t aggressive -o scan.html
+  ./katarina.py 192.168.1.0/24 -p top100 -s tcp
+  ./katarina.py 192.168.1.1,192.168.1.5 -p 22,80,443 -s tcp -o results.pdf
+  ./katarina.py 192.168.1.1 -p all -t stealth -o report.html
 
 
 ```
